@@ -1,0 +1,104 @@
+/**
+ * @return LengthAwarePaginator
+ */
+public function getOperatorFiltered(): LengthAwarePaginator
+{
+    $user = $this->getUserInstance();
+
+    return $this->model
+        ->with('location')
+        ->select([
+            'pools.uuid',
+            'pools.from',
+            'pools.to',
+            'pools.note',
+            'pools.created_at',
+            'pools.location_id'
+        ])
+        ->selectRaw('SUM(IF(tasks.operator_id is null, 1, 0)) as free_tasks')
+        ->selectRaw('SUM(IF((tasks.status in(2, 3, 4, 5, 6, 7, 10) and tasks.operator_id = ?), 1, 0)) as processed',
+            [$user->id])
+        ->selectRaw('SUM(IF(tasks.status = ? and tasks_recalls.recall_time < ?, 1, 0)) as recall_now_count',
+            [TaskStatus::recall, now()])
+        ->selectRaw('COALESCE((select value from pool_quotas where pool_id = pools.id and user_id = ?), 0) as quota',
+            [$user->id])
+        ->selectRaw(
+            'SUM(IF(tasks.status <> ? AND tasks.updated_at >= ? AND tasks.updated_at < ?, 1, 0)) as processed_today',
+            [TaskStatus::new, Carbon::now()->startOfDay(), Carbon::now()->endOfDay()]
+        )->selectRaw(
+            'SUM(IF(tasks.status = ? AND tasks.updated_at >= ? AND tasks.updated_at < ?, 1, 0)) as conversions_today',
+            [TaskStatus::conversion, Carbon::now()->startOfDay(), Carbon::now()->endOfDay()])
+        ->leftJoin('tasks', 'tasks.pool_id', '=', 'pools.id')
+        ->leftJoin('tasks_recalls', 'tasks.id', '=', 'tasks_recalls.task_id')
+        ->groupBy('pools.id')
+        ->where([
+            ['pools.default', 0],
+            ['pools.department_id', $this->getDepartmentId()]
+        ])
+        ->havingRaw("((quota - processed) > 0 and free_tasks > 0) or ((quota - processed) > 0 and recall_now_count > 0)")
+        ->latest('pools.created_at')
+        ->paginate(self::PER_PAGE);
+}
+
+############################
+
+/**
+     * Выбираем количество клиентов, которые остыли
+     * в рамках конверсионной категории прозвона
+     * и остальные из других категорий
+     *
+     * @param  array  $sourcesInIds
+     * @param  array  $sourcesCheckConversionIds
+     * @param  int  $locationId
+     * @param  int  $cyclicityDays
+     * @param  int  $skipDaysInRequests
+     * @param  string|null  $from
+     * @param  bool $pessimization
+     *
+     * @return array
+     */
+    public function getCountForAutoPoolByConditions(
+        array $sourcesInIds,
+        array $sourcesCheckConversionIds,
+        int $locationId,
+        int $cyclicityDays,
+        int $skipDaysInRequests,
+        ?string $from,
+        bool $pessimization
+    ): array
+    {
+        $sourcesCheckCondition = count($sourcesCheckConversionIds)
+            ? "
+                and not exists(
+                    select cr.id
+                    from client_requests cr
+                    where c.id = cr.client_id
+                        and cr.created_at >= now() - INTERVAL " . $skipDaysInRequests . " DAY
+                        and cr.source_id in (" . implode(',', $sourcesCheckConversionIds) . ")
+                )
+                and not exists(
+                    select t.client_id
+                    from tasks t
+                      join pools p on t.pool_id = p.id
+                    where c.id = t.client_id
+                        and t.status in (1, 3, 5, 6, 7, 10) # конверсионные статусы
+                        and p.source_id in (" . implode(',', $sourcesCheckConversionIds) . ")
+                        and t.updated_at > now() - INTERVAL " . $cyclicityDays . " DAY # цикличность = сдвиг дней по задачам
+                )
+            " : "";
+
+        return DB::select("
+            select count(*) as total from (
+                select
+                     c.id as client_id
+                from clients c
+                       join source_client sc on c.id = sc.client_id
+                where c.location_id = " . $locationId . " # локация клиента
+                    and sc.source_id IN (".implode(',', $sourcesInIds).")
+                    " . $this->getFromCondition($from, $sourcesInIds) . "
+                    " . $sourcesCheckCondition . "
+                    " . $this->getPessimizationCondition($pessimization) . "
+                group by c.id
+            ) r2
+        ");
+    }
